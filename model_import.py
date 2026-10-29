@@ -590,7 +590,8 @@ SCENE_TEMPLATE = """<?xml version="1.0" encoding="utf-8"?>
   </worldbody>
 
   <keyframe>
-    <!-- home：真机实测姿态（拍摄点云时的姿态）——无自碰撞、工具尖离地面 {home_tip_z:.3f} m，
+    <!-- home：真机实测姿态（**初始姿态**，不是拍摄位姿 —— 拍摄位姿按任务见
+         revA1_spec.CAPTURE_POSES）——无自碰撞、工具尖离地面 {home_tip_z:.3f} m，
          可以直接作为训练/演示的初始位姿。改姿态后请重跑 check_model.py 复核。 -->
     <key name="home" qpos="{qpos}" ctrl="{qpos}"/>
   </keyframe>

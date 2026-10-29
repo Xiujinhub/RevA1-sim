@@ -1,0 +1,5 @@
+{
+    "cmake.sourceDirectory": "E:/deepenv/mujoco/RevA1-sim/TB6-R5-RevA1",
+    "python-envs.defaultEnvManager": "ms-python.python:conda",
+    "python-envs.defaultPackageManager": "ms-python.python:conda"
+}

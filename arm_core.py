@@ -145,16 +145,16 @@ def draw_tool_arrows(scene, origin, rot, names=None, *,
                      tip_dot: bool = False) -> int:
     """把每个工具画成一根**箭头**，返回画了几根。
 
-    **三根箭头互相平行，而且都平行于末端姿态的工具轴**（= 法兰 ``+z``）—— 三个工具是并排装在
-    同一片法兰上的，所以：
+    **各根箭头互相平行，而且都平行于末端姿态的工具轴**（= 法兰 ``+z``）—— 这些工具是并排装
+    在同一片法兰上的，所以：
 
     * 起点 = 该工具在**法兰平面上的安装点** ``origin + rot @ (vx, vy, 0)``（侧偏就体现在这儿）；
     * 方向 = ``rot @ (0, 0, 1)`` = **末端工具轴**（世界系）；长度 = ``vz`` = 该工具的**轴向长度**；
     * 于是箭头尖 = ``起点 + 方向 · vz`` = ``origin + rot @ v`` = **该工具的 TCP**（与以前一致，
       所以"箭头尖落在 TCP 上"那个检查仍然成立）。
 
-    （早先的版本是"从法兰中心直接画到 TCP"，也就是把 ``v`` 的侧偏也算进方向 —— 那样三根箭头的
-    方向两两差 13.6°~14.9°，画面里是**扇形**；实际三个工具是平行的，这里按物理装法画。）
+    （早先的版本是"从法兰中心直接画到 TCP"，也就是把 ``v`` 的侧偏也算进方向 —— 那样各根箭头的
+    方向两两差 13.6°~14.9°，画面里是**扇形**；实际工具是平行的，这里按物理装法画。）
 
     * ``scene``：``mujoco.Renderer.update_scene()`` 之后的 ``MjvScene``（与 :func:`add_marker`
       一样——只在画面上，不参与物理/碰撞，也不改模型）；
@@ -171,7 +171,7 @@ def draw_tool_arrows(scene, origin, rot, names=None, *,
     keys = spec.tool_names() if names is None else [n for n in names if n in spec.TOOLS]
     origin = np.asarray(origin, dtype=float).ravel()
     rot = np.asarray(rot, dtype=float).reshape(3, 3)
-    axis = rot @ np.array([0.0, 0.0, 1.0])          # 末端工具轴（世界系）= 三根箭头的共同方向
+    axis = rot @ np.array([0.0, 0.0, 1.0])          # 末端工具轴（世界系）= 所有箭头的共同方向
     n = 0
     for name in keys:
         v = spec.tool_vector(name)
@@ -705,7 +705,7 @@ class ArmSim:
         return ee_frame(self.model, self.data)
 
     def tool_points(self, names=None) -> dict[str, np.ndarray]:
-        """各工具 TCP 的**世界坐标**（默认三个都给；顺序 = ``spec.TOOLS``）。"""
+        """各工具 TCP 的**世界坐标**（默认全部都给；顺序 = ``spec.TOOLS``）。"""
         return tool_points(self.model, self.data, names)
 
     def tool_lines(self) -> list[str]:
@@ -722,7 +722,7 @@ class ArmSim:
                         tip_dot: bool = False) -> int:
         """按 :attr:`show_tools` 在当前末端位姿下画工具箭头（每帧调 → 跟着臂动）。
 
-        三根箭头**互相平行、都平行于末端工具轴**（法兰 +z）：从法兰平面上的**安装点**
+        各根箭头**互相平行、都平行于末端工具轴**（法兰 +z）：从法兰平面上的**安装点**
         （``(vx, vy, 0)``）沿工具轴画到各自 **TCP**（长度 = 该工具的轴向长度 ``vz``）。
         默认不加端点小球。返回画了几根。``names`` 给了就用它（忽略 :attr:`show_tools`），
         方便单独出图。
@@ -748,7 +748,7 @@ class ArmSim:
         """把当前各工具的 **TCP**（= 画面上那根箭头的尖）记进轨迹，返回真新增的点数。
 
         界面在"任务中"（收到 6501 的 ``motion: start``）时每帧调它；收到 ``stop`` 就不再调，
-        轨迹自然停住。``names=None`` = 三个工具都记；一般传"界面上勾选的那几个"。
+        轨迹自然停住。``names=None`` = 所有工具都记；一般传"界面上勾选的那几个"。
         """
         n = 0
         for name, p in self.tool_points(names).items():

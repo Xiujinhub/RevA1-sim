@@ -4,7 +4,7 @@
 界面布局
 --------
 左边是 MuJoCo 实时画面（离屏渲染成 QImage 贴上去，不另开窗口），右边是可滚动的控制面板，
-底下一行状态栏；面板分 7 张卡片：
+底下一行状态栏；面板分 8 张卡片：
 
 1. **关节微调**：每个关节一行 ``− 目标角 + 实测角``——**点一下动一点**（按住还能连点）。
    旧版是 6 根滑条，拖起来又不准又不直观，这里直接换成 ± 按钮 + 步长选择。
@@ -14,13 +14,19 @@
 3. **点云（相机 → 机械臂）**：深度相机拍的点云，按**手眼标定 + 拍摄姿态**换算到机械臂基座系，
    生成"带点云 + 小车"的世界场景再整体加载（见 ``point_cloud.py``）——机械臂与点云同框、
    相对位置真实（深度 z 越小越靠近相机），地面按小车高度下移。
-4. **末端目标 / IK**：填工具尖目标（世界系 x/y/z）+ 工具轴方向，``求解 IK`` 只算不动、
+4. **点云 → 路径仿真**：默认走**现场取边**（`toilet_plan.py` 原样移植：点云脊线取边 →
+   内缩圈/栅格/唇遍 → 法兰位姿），再把法兰位姿做**全位姿 IK**（位置+工具轴+J6 滚转）
+   并按关节路点回放（工具尖留轨迹）；没有红/青检测边时退回通用轮廓。
+   ``--plan`` / ``--plan-run`` 可以在启动时自动规划 / 直接仿真。
+5. **末端目标 / IK**：填工具尖目标（世界系 x/y/z）+ 工具轴方向，``求解 IK`` 只算不动、
    ``求解并沿直线运动`` 算完就走。结果里写清楚位置误差 / 姿态误差 / 耗时 / 解出来的 6 个关节角，
    目标点在画面里画成**绿球 + 黄轴**（不可达时变红）。
-5. **点位（示教 / 点到点）**：``记录当前位姿`` 存点，``走到选中点`` 沿直线过去（双击列表也行）。
+6. **点位（示教 / 点到点）**：``记录当前位姿`` 存点，``走到选中点`` 沿直线过去（双击列表也行）。
    这是最直观的"点到点"：先手动摆到位置存下来，以后一键复现。
-6. **运行 / 伺服**：运动时长、进度条、kp 缩放（体会伺服软硬）、暂停、重力、**急停**、复位、存图。
-7. **日志**：每一步动作 + **实测**到位精度（不是只看指令）。
+7. **运行 / 伺服**：运动时长、进度条、kp 缩放（体会伺服软硬）、暂停、重力、**急停**、复位、存图。
+8. **日志**：每一步动作 + **实测**到位精度（不是只看指令）。
+
+9. 拍摄位姿(角度): {99, -137, 121.2, 68.5, 99.1, -100.5}; home位姿(角度): {91.55, -176.10, 133.33, 57.03, 90.49, -106.47}
 
 点到点为什么改成"直线"
 ----------------------
@@ -78,6 +84,7 @@ from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox,  # noqa: E402
 
 import arm_core as core  # noqa: E402
 import point_cloud as pc  # noqa: E402
+import arm_path as ap  # noqa: E402
 import revA1_spec as spec  # noqa: E402
 import robot_link as link  # noqa: E402
 
@@ -439,12 +446,12 @@ class ArmView(QWidget):
         pts = self.sim.path_points
         if pts is not None and len(pts) >= 2:
             pts = np.asarray(pts, dtype=float)
-            step = max(int(len(pts) // 40), 1)
+            step = max(int(len(pts) // 160), 1)
             for i in range(0, len(pts) - 1, step):
                 a, b = pts[i], pts[i + 1]
                 d = b - a
                 seg = float(np.linalg.norm(d))
-                if seg < 1e-6:
+                if seg < 1e-6 or seg > 0.35:      # 太长的段是"换段/接近点"，不画成线
                     continue
                 core.add_marker(scn, mujoco.mjtGeom.mjGEOM_CAPSULE,
                                 (0.0016, seg / 2 + 0.0016, 0.0), (a + b) / 2.0,
@@ -470,7 +477,7 @@ class ArmView(QWidget):
         try:
             self.renderer.update_scene(self.sim.data, camera=self.cam.mjv)
             self._add_markers()
-            self.sim.add_tool_arrows(self.renderer.scene)   # 三个工具 TCP 向量箭头（平行、随臂动）
+            self.sim.add_tool_arrows(self.renderer.scene)   # 各工具 TCP 向量箭头（平行、随臂动）
             self.sim.draw_trails(self.renderer.scene)       # 工具尖轨迹（任务信号驱动）
             arr = self.renderer.render()
         except Exception as e:  # noqa: BLE001
@@ -615,17 +622,27 @@ class ControlPanel(QWidget):
         self.follow_out: link.FollowOut | None = None
         self.follow_error = ""                # 启动失败的原因（留在卡片上）
         self.cloud_scene: Path | None = None  # 当前场景里是否接了点云（None = 干净场景）
+        self.cloud_loaded = ""                # 当前场景里接的是哪份点云（文件路径 / MULTI_CLOUD）
+        self.cloud_loaded_pose = ""           # 接进场景时用的拍摄姿态（文本，用来判断要不要重载）
         self.cloud_report: list[str] = []     # 点云的体检报告（卡片上显示）
         self.cloud_points = None              # 基座系点云（存图时算视角用）
         self.cloud_error = ""
         self.task_listener: link.TaskListener | None = None   # 任务信号（6501）监听，没启动时 None
         self.task_active = False              # 最近一包是 start 且还没收到 over → 正在记轨迹
+        self.plan = None                      # 当前"点云 → 路径"规划结果（arm_path.PathPlan）
+        self.plan_error = ""                  # 规划失败原因（显示在卡片上）
+        self.plan_running = False             # 正在按关节路点仿真
+        self.plan_run_done = 0                # 已跑完的分段数
+        self.plan_pending = -1                # 正在做"转场"运动，跑完接这一段
+        self.plan_t0 = 0.0                    # 仿真开始时间（算速度用）
+        self.plan_trail = ""                  # 仿真时记哪根工具尖轨迹
+        self.plan_points = None               # 规划用的基座系点云（缓存）
 
         lay = QVBoxLayout(self)
         lay.setContentsMargins(2, 2, 2, 2)
         lay.setSpacing(10)
         for builder in (self._build_joints, self._build_tools, self._build_follow,
-                        self._build_task, self._build_cloud,
+                        self._build_task, self._build_cloud, self._build_plan,
                         self._build_cartesian, self._build_points, self._build_run,
                         self._build_log):
             lay.addWidget(builder())
@@ -694,8 +711,8 @@ class ControlPanel(QWidget):
     # ------------------------------------------------------------ 1.5 工具 TCP 向量（画面箭头）
     def _build_tools(self) -> Card:
         card = Card("工具 TCP 向量（跟随机械臂）",
-                    "同一片法兰装了三个工具（真机 TCP 标定给的是**末端系**向量）。"
-                    "画面上每个工具一根箭头，三根互相平行、都平行于末端工具轴，箭头尖落在各自 TCP 上，"
+                    "同一片法兰装了好几个工具（真机 TCP 标定给的是**末端系**向量）。"
+                    "画面上每个工具一根箭头，各根互相平行、都平行于末端工具轴，箭头尖落在各自 TCP 上，"
                     "随机械臂实时动。")
         self.tool_boxes: dict[str, QCheckBox] = {}
         row = QHBoxLayout()
@@ -1129,10 +1146,22 @@ class ControlPanel(QWidget):
         self.c_cloud.setMaximumWidth(200)
         card.add_row(QLabel("点云"), self.c_cloud, self._btn("刷新", self.on_cloud_refresh, name="Preset"))
 
+        # 拍摄位姿按任务登记在 revA1_spec.CAPTURE_POSES（sink / urinal / mirror …）：
+        # 选一下就把该任务的 pose 填进下面的框，省得手抄那 6 个数。
+        self.c_pose_task = QComboBox()
+        self.c_pose_task.addItem("手动 / 其它", "")
+        for key in spec.capture_names():
+            self.c_pose_task.addItem(spec.CAPTURE_POSES[key]["label"], key)
+        self.c_pose_task.setToolTip("按任务一键填「拍摄姿态」：sink 清洁 / urinal 喷水 / mirror 镜面清洁\n"
+                                    "（= revA1_spec.CAPTURE_POSES：真机关节角 + 该姿态的 pose）")
+        self.c_pose_task.currentIndexChanged.connect(self.on_cloud_pose_task)
+        card.add_row(QLabel("任务位姿"), self.c_pose_task, None)
+
         self.c_pose = QLineEdit(pc.pose_text(pc.DEFAULT_POSE))
         self.c_pose.setToolTip("拍摄姿态：x y z(mm) + rx ry rz(deg)（= 真机 pose 的 6 个数）")
         card.add_row(QLabel("拍摄姿态"), self.c_pose)
-        card.add_row(self._btn("取真机姿态", self.on_cloud_pose_from_robot, name="Preset"), None)
+        card.add_row(self._btn("取真机姿态", self.on_cloud_pose_from_robot, name="Preset"),
+                     self._btn("摆到该姿态", self.on_cloud_pose_move, name="Preset"), None)
 
         self.c_calib = QLineEdit(str(pc.DEFAULT_EXTRINSIC))
         self.c_calib.setToolTip("手眼标定（OpenCV XML 里的 R / t：相机 → 末端，单位 mm）")
@@ -1249,11 +1278,16 @@ class ControlPanel(QWidget):
                 f"{sum(len(g['files']) for g in groups)} 份）")
 
     def _sync_cloud_mode(self, *_args) -> None:
-        """切到多组模式时把「拍摄姿态」框置灰 —— 每组的位姿写在 config 里，改这个框不管用。"""
+        """切到多组模式时把「任务位姿 / 拍摄姿态」框置灰 —— 每组的位姿写在 config 里，改这个框不管用。"""
         multi = self.cloud_is_multi()
         self.c_pose.setEnabled(not multi)
+        self.c_pose_task.setEnabled(not multi)
         self.c_pose.setToolTip("多组点云模式：每组的拍摄姿态写在 config.json 里（本框不参与）" if multi
                                else "拍摄姿态：x y z(mm) + rx ry rz(deg)（= 真机 pose 的 6 个数）")
+        self.c_pose_task.setToolTip(
+            "多组点云模式：每组的拍摄姿态写在 config.json 里（可用 \"task\": \"mirror\"）" if multi
+            else "按任务一键填「拍摄姿态」：sink 清洁 / urinal 喷水 / mirror 镜面清洁\n"
+                 "（= revA1_spec.CAPTURE_POSES：真机关节角 + 该姿态的 pose）")
 
     def set_cloud_file(self, path) -> None:
         """把下拉框切到某个文件（不在列表里就临时加进去）。"""
@@ -1301,6 +1335,37 @@ class ControlPanel(QWidget):
         self.c_pose.setText(pc.pose_text(vals))
         self.sim.log("拍摄姿态已填成真机当前 pose：["
                      + ", ".join(f"{v:.2f}" for v in vals) + "]（mm, deg）")
+        self.refresh()
+
+    def on_cloud_pose_task(self) -> None:
+        """「任务位姿」下拉：把该任务登记的拍摄位姿填进姿态框（mm + 度）。"""
+        key = str(self.c_pose_task.currentData() or "")
+        if not key:
+            return
+        item = spec.CAPTURE_POSES.get(key)
+        if item is None:
+            return
+        self.c_pose.setText(pc.pose_text(item["pose"]))
+        self.sim.log(f"拍摄姿态 ← {item['label']}（{key}）：["
+                     + ", ".join(f"{v:.2f}" for v in item["pose"]) + "]（mm, deg）")
+        self.refresh()
+
+    def on_cloud_pose_move(self) -> None:
+        """「摆到该姿态」：让机械臂（关节空间 P2P）开到选中的任务拍摄姿态。
+
+        = 当初拍这份点云时机械臂的关节角（``spec.CAPTURE_POSES[...]["qpos_deg"]``），
+        这样画面里的机械臂和点云就是同一个视角，能直接看出标定/位姿对不对。
+        """
+        key = str(self.c_pose_task.currentData() or "")
+        item = spec.CAPTURE_POSES.get(key)
+        if item is None:
+            self.sim.log("先在「任务位姿」里选一个任务，再点「摆到该姿态」")
+            return
+        q = np.asarray(spec.capture_qpos(key), dtype=float)
+        self.sim.start_p2p(q, self.move_time(), kind="p2p", src="task",
+                           label=f"{item['label']} 拍摄姿态")
+        self.sim.log(f"开到 {item['label']} 的拍摄姿态："
+                     + "、".join(f"{v:.1f}" for v in np.degrees(q)) + "°（关节空间）")
         self.refresh()
 
     def cloud_kwargs(self) -> dict:
@@ -1376,7 +1441,12 @@ class ControlPanel(QWidget):
         if not self.win.load_scene(self.cloud_scene, log=False):
             self.cloud_error = "场景重建失败（看日志）"
             self.cloud_scene = None
+            self.cloud_loaded = ""
+            self.cloud_loaded_pose = ""
         else:
+            self.cloud_loaded = MULTI_CLOUD if groups else str(Path(path).resolve())
+            self.cloud_loaded_pose = (pc.pose_text(groups[0].get("pose", pc.DEFAULT_POSE))
+                                      if groups else self.c_pose.text().strip())
             self.sim.log(f"点云已接进场景：{res['scene'].summary()}"
                          f"（总耗时 {(time.perf_counter() - t0) * 1000:.0f} ms）")
             for line in self.cloud_report:
@@ -1396,6 +1466,8 @@ class ControlPanel(QWidget):
             return
         ok = self.win.load_scene(spec.SCENE_XML, log=False)
         self.cloud_scene = None
+        self.cloud_loaded = ""
+        self.cloud_loaded_pose = ""
         self.cloud_points = None
         self.cloud_report = []
         self.cloud_error = "" if ok else "回不到基场景（看日志）"
@@ -1442,6 +1514,284 @@ class ControlPanel(QWidget):
                     f"位置由**手眼标定 + 拍摄姿态**决定；「离地高度」按小车高度铺的地面算"
                     f"（默认 {pc.DEFAULT_CART_HEIGHT_M:.2f} m）。")
         return "\n".join([f"状态：已接进场景 {Path(self.cloud_scene).name}"] + self.cloud_report[:9])
+
+    # ------------------------------------------------------------ 3b. 点云 → 路径仿真
+    def _build_plan(self) -> Card:
+        card = Card("点云 → 路径仿真",
+                    "把**点云卡片里选中的那份点云**变成一条作业路径，再让仿真臂按关节路点走一遍"
+                    "（工具尖会留下轨迹）。默认 **自动**：点云里带红/青检测边缘时走**现场取边**"
+                    "（`toilet_plan.py` 原样移植：点云脊线取边 → 内缩圈/栅格 → 法兰位姿）；"
+                    "没有检测边时退回**通用轮廓**。")
+        self.p_engine = QComboBox()
+        self.p_engine.addItems(["自动（有红/青边 → 现场取边）", "现场取边（toilet 实例）",
+                                "通用轮廓（点云外轮廓）"])
+        self.p_engine.setToolTip("现场取边 = 本工程 `toilet_plan.py`（现场 toilet 实例原样移植）：\n"
+                                 "红=盆口边缘、青=收缩后边缘，从点云脊线取边，再走内缩圈+栅格，\n"
+                                 "法兰位姿用现场固定到达姿态。\n"
+                                 "通用轮廓 = 用点云投影外轮廓生成环形/螺旋/栅格（无检测边时用）")
+        card.add_row(QLabel("算法"), self.p_engine, None,
+                     self._btn("规划路径", self.on_plan_build, name="Primary"))
+        self.p_mode = QComboBox()
+        self.p_mode.addItems(["环形 + 栅格（默认）", "环形", "螺旋", "栅格"])
+        self.p_mode.setToolTip("现场取边：内缩圈 + 栅格（可选唇遍）；\n"
+                               "通用轮廓：环形 / 螺旋 / 栅格 / 环形+栅格")
+        self.p_lip = QCheckBox("加唇遍")
+        self.p_lip.setChecked(False)
+        self.p_lip.setToolTip("现场取边专用：沿收缩边（青）生成 rim_left / rim_right 两半圈；"
+                              "现场默认不生成")
+        card.add_row(QLabel("走法"), self.p_mode, self.p_lip, None)
+        self.p_standoff = NumBox()
+        self.p_standoff.setRange(0.0, 800.0)
+        self.p_standoff.setSingleStep(20.0)
+        self.p_standoff.setValue(0.0)
+        self.p_standoff.setSuffix(" mm")
+        self.p_standoff.setToolTip("工具尖（喷嘴）到目标点的距离。**0 = 自动**：\n"
+                                   "  现场取边：现场口径 auto（按足迹 ≤35%×口短边收紧，toilet-1 实测 200.4 mm）；\n"
+                                   "  通用轮廓：400 mm（本仿真 tool_site 只有 42.7 mm，要留出喷嘴/工具长度）")
+        self.p_step = NumBox()
+        self.p_step.setRange(0.0, 150.0)
+        self.p_step.setSingleStep(5.0)
+        self.p_step.setValue(0.0)
+        self.p_step.setSuffix(" mm")
+        self.p_step.setToolTip("相邻路径的间距。**0 = 自动**：\n"
+                               "  现场取边：按喷锥足迹 D=2·standoff·tan(15°)、间距 s=D·(1-20%)（toilet-1 实测 85.9 mm）；\n"
+                               "  通用轮廓：40 mm")
+        self.p_inset = NumBox()
+        self.p_inset.setRange(0.0, 120.0)
+        self.p_inset.setSingleStep(5.0)
+        self.p_inset.setValue(10.0)
+        self.p_inset.setSuffix(" mm")
+        self.p_inset.setToolTip("通用轮廓的轮廓内缩（现场取边固定用 EDGE_INSET_MM=10，内缩圈 40）")
+        card.add_row(QLabel("喷距"), self.p_standoff, QLabel("步距"), self.p_step)
+        self.p_snap = NumBox()
+        self.p_snap.setRange(0.0, 120.0)
+        self.p_snap.setSingleStep(5.0)
+        self.p_snap.setValue(40.0)
+        self.p_snap.setSuffix(" mm")
+        self.p_snap.setToolTip("把路径点吸附到真实点云的搜索半径（0 = 不吸附，只走拟合面）")
+        self.p_speed = NumBox()
+        self.p_speed.setRange(20.0, 500.0)
+        self.p_speed.setSingleStep(10.0)
+        self.p_speed.setValue(160.0)
+        self.p_speed.setSuffix(" mm/s")
+        self.p_speed.setToolTip("仿真速度：路径长度 / 速度 = 运动时间（只影响仿真时长）")
+        card.add_row(QLabel("内缩"), self.p_inset, QLabel("吸附"), self.p_snap)
+        self.p_points = NumBox()
+        self.p_points.setRange(60, 1500)
+        self.p_points.setSingleStep(60)
+        self.p_points.setValue(420)
+        self.p_points.setToolTip("路径点上限（点越多越细，IK 规划和仿真也越久）")
+        self.p_center = QCheckBox("规划后看过去")
+        self.p_center.setChecked(True)
+        self.p_center.setToolTip("规划完把视角挪到作业面中心（不影响机械臂）")
+        card.add_row(QLabel("点数上限"), self.p_points,
+                     QLabel("速度"), self.p_speed)
+        card.add_row(self.p_center, None, None, None)
+        card.add_row(self._btn("开始仿真", self.on_plan_run, name="Preset"),
+                     self._btn("停止", self.on_plan_stop, name="Danger"),
+                     self._btn("清除", self.on_plan_clear, name="Danger"), None)
+        self.plan_label = QLabel()
+        self.plan_label.setObjectName("Mono")
+        self.plan_label.setWordWrap(True)
+        self.plan_label.setMinimumHeight(120)
+        self.plan_label.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+        card.add(self.plan_label)
+        return card
+
+    # ---- 点云 → 路径：参数 / 按钮
+    def plan_mode(self) -> str:
+        """卡片上的走法 → :class:`arm_path.PlanSettings` 的 ``mode``。"""
+        return ("ring+raster", "ring", "spiral", "raster")[self.p_mode.currentIndex()]
+
+    def plan_settings(self) -> "ap.PlanSettings":
+        return ap.PlanSettings(mode=self.plan_mode(),
+                               engine=("auto", "field", "outline")[self.p_engine.currentIndex()],
+                               lip=bool(self.p_lip.isChecked()),
+                               standoff_mm=float(self.p_standoff.value()),
+                               step_mm=float(self.p_step.value()),
+                               inset_mm=float(self.p_inset.value()),
+                               snap_mm=float(self.p_snap.value()),
+                               speed_mm_s=float(self.p_speed.value()),
+                               max_points=int(self.p_points.value()))
+
+    def plan_cloud_source(self) -> tuple[str, str]:
+        """规划用哪份点云：``(文件, 拍摄姿态)``；多组模式取第一组（它有自己的位姿）。"""
+        if self.cloud_is_multi():
+            groups = pc.load_cloud_groups()
+            if groups:
+                g = groups[0]
+                return str(g["files"][0]), pc.pose_text(g.get("pose", pc.DEFAULT_POSE))
+            return "", ""
+        return self.cloud_file(), self.c_pose.text().strip()
+
+    def on_plan_build(self) -> None:
+        """「规划路径」：读点云 → 取轮廓 → 生成路径 → 逐点 IK（同步，几秒）。"""
+        path, pose = self.plan_cloud_source()
+        if not path:
+            self.sim.log("没有选点云：先在点云卡片的列表里选一份（或点「刷新」）")
+            return
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            want = str(Path(path).resolve())
+            need = self.cloud_scene is None
+            if not self.cloud_is_multi():
+                need = need or self.cloud_loaded != want or self.cloud_loaded_pose != pose
+            if need:
+                self.set_cloud_file(path)                 # 画面里还没有这份点云 → 先接进来
+                self.c_pose.setText(pose)
+                self.on_cloud_load()
+            self.sim.log(f"路径规划：{Path(path).name}（{self.p_engine.currentText()} / "
+                         f"{self.p_mode.currentText()}）……")
+            QApplication.processEvents()                  # 先把这行日志刷出来，再开始算
+            ref = "flange" if self.c_ref.currentIndex() == 1 else "tcp"
+            off = (float(self.c_dx.value()), float(self.c_dy.value()), float(self.c_dz.value()))
+            inputs = ap.load_inputs(
+                path, pose=pose, extrinsic=self.c_calib.text().strip(),
+                frame=("auto", "cam", "end")[self.c_frame.currentIndex()],
+                ref=ref, offset_mm=off, yaw_deg=float(self.c_yaw.value()))
+            self.plan_points = inputs["points"]
+            self.plan = ap.build_plan(inputs["points"], self.plan_settings(),
+                                      seeds=inputs["seeds"], camera=inputs["camera"],
+                                      sim=self.sim, cloud_path=path, pose=pose,
+                                      ref=ref, offset_mm=off,
+                                      yaw_deg=float(self.c_yaw.value()))
+            self.plan_error = ""
+            self._plan_stop_silent()
+            self.sim.path_points = np.asarray(self.plan.tcp, dtype=float)
+            self.plan_label.setText(self._plan_text())
+            self.sim.log(self.plan.summary())
+            for line in self.plan.report:
+                self.sim.log("    " + line)
+            if self.p_center.isChecked():
+                self.focus_plan()
+        except Exception as exc:                          # noqa: BLE001  （文件/标定/IK 都可能抛）
+            self.plan = None
+            self.plan_error = f"{type(exc).__name__}: {exc}"
+            self.plan_label.setText(self._plan_text())
+            self.sim.log(f"路径规划失败：{self.plan_error}")
+        finally:
+            QApplication.restoreOverrideCursor()
+
+    def focus_plan(self) -> None:
+        """把画面视角挪到作业面（规划后的"看过去"）。"""
+        if self.plan is None:
+            return
+        cam = self.win.view.cam
+        cam.mjv.lookat[:] = 0.55 * np.asarray(self.plan.center, dtype=float)   # 机械臂与作业面之间
+        cam.mjv.distance = max(1.8, 2.6 * float(self.plan.radius_mm) / 1000.0 + 0.8)
+        cam.mjv.azimuth, cam.mjv.elevation = 145.0, -14.0
+
+    def on_plan_run(self) -> None:
+        """「开始仿真」：把规划出的关节路点按段回放（工具尖轨迹会留在画面里）。"""
+        if self.plan is None or not self.plan.runs:
+            self.sim.log("还没有可执行的路径：先点「规划路径」（IK 可解点要 ≥ 2 个）")
+            return
+        if self.plan_running:
+            self._plan_stop_silent()
+        self.sim.hold()                                   # 取消当前运动，先定住
+        self.plan_running = True
+        self.plan_run_done = 0
+        self.plan_pending = -1
+        self.plan_t0 = time.perf_counter()
+        self.plan_trail = ap.tool_trail_name(self.sim)
+        tr = self.sim.trail(self.plan_trail) if self.plan_trail else None
+        if tr is not None:
+            tr.clear()
+        self.sim.log(f"路径仿真开始：{len(self.plan.runs)} 段 / 约 {self.plan.total_seconds:.1f} s，"
+                     f"记「{self.plan_trail}」工具尖轨迹")
+        self._start_plan_run(0)
+
+    def _start_plan_run(self, i: int) -> None:
+        if self.plan is None or not (0 <= i < len(self.plan.runs)):
+            self._finish_plan_run()
+            return
+        qs = np.asarray(self.plan.runs[i], dtype=float)
+        # 段与段之间可能换了解支：先在关节空间平滑"转场"过去，别让伺服把工具甩出去
+        dq = float(np.abs(np.degrees(qs[0] - np.asarray(self.sim.cmd, dtype=float))).max())
+        if dq > 8.0:
+            sec = min(max(dq / 120.0, 0.5), 2.0)
+            self.plan_pending = i
+            self.sim.motion = core.Motion(np.asarray(self.sim.cmd, dtype=float), qs[0],
+                                         sec, self.sim.dt, kind="plan", label="转身/转场")
+            self.sim.mode = "plan"
+            self.sim.log(f"    第 {i + 1} 段前转场：最大关节差 {dq:.0f}°，{sec:.1f} s")
+            return
+        m = ap.make_run_motion(self.sim, self.plan, i)
+        if m is None:
+            self._finish_plan_run()
+            return
+        self.sim.motion = m
+        self.sim.mode = "plan"
+        self.sim.log(f"    第 {i + 1}/{len(self.plan.runs)} 段：{m.n} 步 / {m.n * self.sim.dt:.1f} s")
+
+    def _finish_plan_run(self) -> None:
+        n = self.plan_run_done
+        sec = time.perf_counter() - self.plan_t0 if self.plan_t0 else 0.0
+        self.plan_running = False
+        tr = self.sim.trail(self.plan_trail, create=False) if self.plan_trail else None
+        self.sim.log(f"路径仿真完成：{n} 段 / {sec:.1f} s" + (f"（{tr.text()}）" if tr else ""))
+
+    def plan_tick(self) -> None:
+        """主循环每帧调：段跑完就接下一段；跑的过程中把工具尖记进轨迹。"""
+        if not self.plan_running:
+            return
+        if self.plan_trail:
+            self.sim.record_trails([self.plan_trail])
+        if self.sim.moving():
+            return
+        if self.plan_pending >= 0:                 # 转场跑完 → 接原来那一段
+            i, self.plan_pending = self.plan_pending, -1
+            self._start_plan_run(i)
+            return
+        self.plan_run_done += 1
+        if self.plan is None or self.plan_run_done >= len(self.plan.runs):
+            self._finish_plan_run()
+        else:
+            self._start_plan_run(self.plan_run_done)
+
+    def _plan_stop_silent(self) -> None:
+        was = self.plan_running
+        self.plan_running = False
+        self.plan_pending = -1
+        if was and getattr(self.sim, "motion", None) is not None:
+            self.sim.hold()
+
+    def on_plan_stop(self) -> None:
+        """「停止」：就地保持（不删轨迹、不删路径）。"""
+        if not self.plan_running:
+            self.sim.log("现在没有在跑路径仿真")
+            return
+        self._plan_stop_silent()
+        self.sim.log(f"路径仿真已停止（跑完 {self.plan_run_done} 段，工具尖保持当前位置）")
+
+    def on_plan_clear(self) -> None:
+        """「清除」：去掉路径与工具尖轨迹（点云场景不动）。"""
+        self._plan_stop_silent()
+        had_trail = bool(self.plan_trail)
+        if self.plan_trail:
+            self.sim.clear_trails([self.plan_trail])
+        self.plan = None
+        self.plan_error = ""
+        self.plan_points = None
+        self.plan_trail = ""
+        self.sim.path_points = None
+        self.plan_label.setText(self._plan_text())
+        self.sim.log("已清除路径" + ("和轨迹" if had_trail else ""))
+
+    def _plan_text(self) -> str:
+        if self.plan is None:
+            note = f"（上次失败：{self.plan_error}）\n" if self.plan_error else "\n"
+            return ("状态：还没有路径" + note
+                    + "「规划路径」→ 沿点云轮廓生成环形/螺旋/栅格并逐点解 IK；\n"
+                    + "「开始仿真」→ 仿真臂按关节路点走一遍，工具尖留轨迹。\n"
+                    + "点云卡片里选哪份，这里就规划哪份（同拍摄姿态 / 手眼标定）。")
+        lines = [f"状态：{self.plan.summary()}"]
+        lines += self.plan.report
+        if self.plan_running:
+            lines.append(f"仿真中：第 {self.plan_run_done + 1}/{len(self.plan.runs)} 段，"
+                         f"已用 {time.perf_counter() - self.plan_t0:.1f} s")
+        return "\n".join(lines)
+
 
     # ------------------------------------------------------------ 4. 末端目标 / IK
     def _build_cartesian(self) -> Card:
@@ -1771,6 +2121,7 @@ class ControlPanel(QWidget):
         self.bar.setValue(int(round(st["progress"] * 1000)))
         self.follow_label.setText(self._follow_text())
         self.cloud_label.setText(self._cloud_text())
+        self.plan_label.setText(self._plan_text())
         self.tool_label.setText("\n".join(self.sim.tool_lines()))
         self.task_label.setText(self._task_text())
 
@@ -1781,7 +2132,7 @@ class ControlPanel(QWidget):
 
 # =============================================================== 主窗口
 MODE_NAMES = {"joint": "单关节", "p2p": "关节点到点", "cartesian": "笛卡尔直线",
-              "hold": "急停保持", "follow": "真机跟随"}
+              "hold": "急停保持", "follow": "真机跟随", "plan": "路径仿真"}
 
 
 class RevA1Window(QMainWindow):
@@ -1882,6 +2233,7 @@ class RevA1Window(QMainWindow):
         self.t_last = t0
         self.panel.follow_tick()                   # 真机跟随：先更新目标，再推进物理
         self.panel.task_tick()                     # 任务信号 → 工具尖轨迹（start 记 / over 清）
+        self.panel.plan_tick()                     # 点云路径仿真：逐段回放 + 记工具尖轨迹
         if not self.paused:
             self.acc += dt_wall
             n = 0
@@ -2031,6 +2383,9 @@ class RevA1Window(QMainWindow):
                                   f"（{new.model.nq} 轴 · {new.model.ngeom} 几何 · "
                                   f"地面 z = {new.floor_z:.3f} m）")
         self.panel.apply_pad_visibility()      # 换场景后把「作业点标记」的显示状态接上
+        if self.panel.plan is not None:        # 路径是"基座系"的：换场景不失效，重新挂到新模型上
+            self.panel._plan_stop_silent()
+            new.path_points = np.asarray(self.panel.plan.tcp, dtype=float)
         self.panel.refresh()
         return True
 
@@ -2067,7 +2422,8 @@ def run_selftest(args) -> int:
         if not cond:
             fails.append(name)
 
-    sim = core.ArmSim(args.scene, move_seconds=args.move_time, log_scene=False)
+    sim = core.ArmSim(args.scene, move_seconds=args.move_time, log_scene=False,
+                      joint_limits=None)   # 自检用 URDF 默认限位（config 里的生产限位会挡住测试目标）
 
     def run_until_idle(limit_s: float = 12.0) -> int:
         n, lim = 0, int(limit_s / sim.dt)
@@ -2337,6 +2693,10 @@ def run_ui_test(args) -> int:
     check("关节控件 6 行", len(panel.joint_rows) == 6)
     check("状态栏有内容", len(win.st_mode.text()) > 6 and len(win.st_tip.text()) > 10,
           win.st_mode.text() + " ｜ " + win.st_tip.text())
+    check("工具卡片：每个工具一个勾选框（含水刮）",
+          list(panel.tool_boxes) == spec.tool_names(), "、".join(panel.tool_boxes))
+    check("任务信号卡片：轨迹勾选框 = 每个工具一个",
+          list(panel.trail_boxes) == spec.tool_names(), "、".join(panel.trail_boxes))
 
     # 关节 −/+ 按钮：真的点按钮（走信号链路，不是直接调函数）
     q0 = sim.cmd_deg().copy()
@@ -2486,6 +2846,19 @@ def run_ui_test(args) -> int:
           abs(panel.c_cart_x.value() - 150.0) < 1e-9 and abs(panel.c_cart_y.value() - 150.0) < 1e-9,
           f"({panel.c_cart_x.value():.0f}, {panel.c_cart_y.value():.0f}) mm")
 
+    # 「任务位姿」下拉：sink / urinal / mirror 各任务的拍摄位姿一点就填进姿态框
+    keys = [panel.c_pose_task.itemData(i) for i in range(panel.c_pose_task.count())]
+    check("点云卡片：任务位姿下拉 = 手动 + 登记过的任务",
+          keys == ["", *spec.capture_names()],
+          "、".join(panel.c_pose_task.itemText(i) for i in range(panel.c_pose_task.count())))
+    panel.c_pose_task.setCurrentIndex(panel.c_pose_task.findData("mirror"))
+    win.pump(0.1)
+    want_mirror = pc.pose_text(spec.capture_pose("mirror"))
+    check("点云卡片：选 mirror → 拍摄姿态填成该任务的 pose",
+          panel.c_pose.text().strip() == want_mirror, panel.c_pose.text().strip())
+    panel.c_pose_task.setCurrentIndex(0)              # 还原「手动 / 其它」
+    # 「摆到该姿态」会真的开动机械臂 → 放到自检最后再测（见下面的「摆到该姿态」一段）
+
     # 「作业点标记」= 那个绿色圆盘：默认不显示，勾上就回来（任何场景都管用）
     gid_pad = mujoco.mj_name2id(win.sim.model, mujoco.mjtObj.mjOBJ_GEOM, "target_pad")
     check("作业点标记：默认不勾 → 绿圆盘被藏起来",
@@ -2530,6 +2903,19 @@ def run_ui_test(args) -> int:
           panel.cloud_scene is None and abs(win.sim.floor_z + 0.171217) < 2e-3,
           f"floor_z = {win.sim.floor_z:.4f} m")
 
+    # 「任务位姿 → 摆到该姿态」：关节空间 P2P 的目标角 = 该任务的拍摄姿态。
+    # 这会真的开动机械臂，所以放在最后（前面那些用例都靠“当前姿态”）。
+    panel.c_pose_task.setCurrentIndex(panel.c_pose_task.findData("mirror"))
+    panel.on_cloud_pose_move()
+    win.pump(0.05)
+    q_end = np.asarray(getattr(getattr(win.sim, "motion", None), "q_end", np.zeros(6)),
+                       dtype=float)
+    check("点云卡片：摆到该姿态 → 目标角 = mirror 拍摄姿态",
+          np.abs(q_end - np.asarray(spec.capture_qpos("mirror"))).max() < 1e-9,
+          "、".join(f"{v:.1f}" for v in np.degrees(q_end)) + "°")
+    win.sim.hold()
+    panel.c_pose_task.setCurrentIndex(0)
+
     win.close()
     print("-" * 78)
     if fails:
@@ -2553,7 +2939,7 @@ def run_gui(args) -> int:
     print("键盘     : 空格=暂停  H=回 home  R=复位  G=重力  F=真机跟随  1..6=选关节  "
           "−/=±一个步长  Ctrl+S=存图  ESC=退出")
     print("面板     : ① 关节 −/+ 微调  ② 真机跟随（UDP 广播 / HTTP 状态）  ③ 点云（相机 → 机械臂）"
-          "  ④ 末端目标 / IK  ⑤ 点位（示教点到点）  ⑥ 运行 / 伺服  ⑦ 日志")
+          "\n           ④ 点云 → 路径仿真  ⑤ 末端目标 / IK  ⑥ 点位（示教点到点）  ⑦ 运行 / 伺服  ⑧ 日志")
     if args.follow_source:
         win.panel.f_source.setCurrentIndex(link.SOURCES.index(args.follow_source))
     if args.follow_url:
@@ -2579,6 +2965,10 @@ def run_gui(args) -> int:
     if cloud:
         win.panel.set_cloud_file(cloud)
         win.panel.on_cloud_load()
+    if getattr(args, "plan", False) or getattr(args, "plan_run", False):
+        win.panel.on_plan_build()
+        if getattr(args, "plan_run", False):
+            win.panel.on_plan_run()
     if getattr(args, "task_port", 0):
         win.panel.t_task_port.setValue(int(args.task_port))
     if getattr(args, "task_listen", False):
@@ -2604,8 +2994,8 @@ def main(argv: list[str] | None = None) -> int:
         description="TB6-R5-RevA1 交互控制台（PySide6 + MuJoCo）",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     ap.add_argument("--scene", default=str(spec.SCENE_XML), help="场景 XML")
-    ap.add_argument("--width", type=int, default=960, help="离屏渲染宽度[px]")
-    ap.add_argument("--height", type=int, default=600, help="离屏渲染高度[px]")
+    ap.add_argument("--width", type=int, default=1280, help="离屏渲染宽度[px]")
+    ap.add_argument("--height", type=int, default=720, help="离屏渲染高度[px]")
     ap.add_argument("--fps", type=float, default=30.0, help="画面刷新上限[fps]")
     ap.add_argument("--kp-scale", type=float, default=1.0, help="启动时的 kp/kv 缩放")
     ap.add_argument("--move-time", type=float, default=1.5, help="默认运动时长[s]")
@@ -2624,6 +3014,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--point-cloud", default=None,
                     help="启动时接进场景的点云文件；**不给这个参数 = 用 config.json 里配的**"
                          "（point_cloud_groups / point_cloud_file），传空串 \"\" = 不加载点云（干净场景）")
+    ap.add_argument("--plan", action="store_true",
+                    help="启动后自动按当前点云规划一条作业路径（只规划，不开始仿真）")
+    ap.add_argument("--plan-run", action="store_true",
+                    help="启动后自动规划并开始路径仿真")
     ap.add_argument("--task-listen", action="store_true",
                     help="启动时自动开「任务信号」监听（默认 UDP 6501）")
     ap.add_argument("--task-port", type=int, default=0, help="覆盖任务信号 UDP 端口")

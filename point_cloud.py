@@ -24,11 +24,23 @@
 （和真机广播 ``pose`` 同一套，见 ``robot_link.py``）。镜头朝哪，就看工具轴
 ``Rz(rz)Ry(ry)Rx(rx)`` 的第三列。
 
-**③ 点云** ``point_cloud/*.json``，两种写法都认：
+**拍摄姿态是按任务分的**：一个活一个姿态，登记在 ``revA1_spec.CAPTURE_POSES``
+（``sink`` / ``urinal`` / ``mirror`` …，每档带真机关节角 ``qpos_deg`` 和该姿态的 ``pose``）。
+本模块的 ``DEFAULT_POSE`` = sink / urinal 那一档；别的任务用 ``spec.capture_pose("mirror")``，
+或多组点云配置里写 ``"task": "mirror"``。
 
-* ``{"depth_o2e": [[x,y,z], ...], "box": {...}, "depth_n": N}`` —— 已经在相机系里的 3D 点（mm）；
+**③ 点云** ``point_cloud/*.json``，现在四种写法都认（本质都是"目标 → 末端"的 3D 点）：
+
+* ``{"depth_o2e": [[x,y,z], ...], "box": {...}, "depth_n": N}`` —— 扁平 3D 点列（mm），
+  可能是末端系（``o2e``），也可能文件里声明了别的坐标系；
+* ``{"boxes": [{"points": [{"px","py","o2c","o2e","rgb","hl"}, ...]}, ...]}`` ——
+  逐像素点对象（``toilet-1.json`` 那种几十 MB 的大文件）；本模块**流式**扫文本，
+  只抠 ``o2e``（没有就退回 ``o2c``），并顺带解析 ``highlight_points``（检测边缘线/关键点）；
 * ``{"depth": {"png_base64": ..., "encoding": "16UC1", "depth_scale": s, "box": {...}}}``
-  —— 16 位深度图，本模块自己解码 PNG + 用内参反投影（含畸变校正），所以不需要 OpenCV。
+  —— 16 位深度图，本模块自己解码 PNG + 用内参反投影（含畸变校正），所以不需要 OpenCV；
+* 嵌套检测结果 ``*_3d: [{"cam": [...], "end": [...]}, ...]`` —— 点云本身用上面的，
+  这些轮廓/内部点收进 ``cloud.meta["seed_groups"]``，给"点云 → 路径"当取边种子
+  （见 ``arm_path.py``）。``end`` 就是 o2e，``cam`` 是相机光学系。
 
 坐标链
 ------
@@ -108,8 +120,10 @@ RUNS = HERE / "runs"                  # 预览图 / 自检产物（.gitignore �
 
 DEFAULT_EXTRINSIC = CALIB_DIR / "calib_extrinsic.xml"
 DEFAULT_INTRINSIC = CALIB_DIR / "calib_intrinsic_1st.xml"
-# 这份数据拍摄时的真机 TCP 位姿：mm + 外旋 XYZ 欧拉角[deg]（= 真机 pose 字段）
-DEFAULT_POSE = (110.862, -5.474, 396.436, 196.64, 34.89, 111.77)
+# 默认拍摄位姿 = sink / urinal 那一档（真机 pose 标定值：mm + 外旋 XYZ 欧拉角[deg]）。
+# 别的任务（mirror …）的拍摄位姿见 ``revA1_spec.CAPTURE_POSES``；多组点云配置里可以
+# 直接写 ``"task": "mirror"`` 来用该任务的位姿（见 load_cloud_groups）。
+DEFAULT_POSE = spec.CAPTURE_POSE
 DEFAULT_CART_HEIGHT_M = 1.10          # 机械臂装在小车上，基座离地约 1.1 m
 # 小车外形（**半**尺寸[m]）与它在基座系里的位置（mm）。
 # 真机上机械臂是贴着车**前缘**装的（要够得着前面），所以默认把小车往 (+x, +y) 挪：
@@ -442,15 +456,192 @@ def _points_from_json(obj) -> np.ndarray | None:
 
 
 def _box_tuple(box_d) -> tuple[int, int, int, int] | None:
-    if isinstance(box_d, dict) and all(k in box_d for k in ("x", "y", "w", "h")):
+    """``{"x","y","w","h"}`` 或 ``{"x","y","width","height"}`` → ``(x, y, w, h)``。"""
+    if not isinstance(box_d, dict):
+        return None
+    if all(k in box_d for k in ("x", "y", "w", "h")):
         return (int(box_d["x"]), int(box_d["y"]), int(box_d["w"]), int(box_d["h"]))
+    if all(k in box_d for k in ("x", "y", "width", "height")):
+        return (int(box_d["x"]), int(box_d["y"]), int(box_d["width"]),
+                int(box_d["height"]))
     return None
+
+
+# ---------------------------------------------------------------- 多格式兼容
+# 现场导出的点云不止一种写法（都是"目标 → 末端"的 3D 点，只是外壳不同）：
+#   ① ``depth_o2e: [[x,y,z], ...]``                      —— 扁平点列（sink_* / urinal_o2e_*）
+#   ② ``depth: {png_base64, ...}``                       —— 16 位深度图（urinal-1.json）
+#   ③ ``boxes[].points[] = {px, py, o2c, o2e, rgb, hl}`` —— 逐像素点对象（toilet-1.json，几十 MB）
+#   ④ 嵌套检测结果 ``*_3d: [{cam:[...], end:[...]}, ...]`` —— 目标轮廓/内部点（urinal-1.json）
+# ③ 的文件动辄 50 MB，``json.loads`` 会展开成上百万个 Python 对象（内存 ×20），
+# 所以这里**流式**扫文本，只把需要的 ``o2e`` 三元组抠出来。
+_TRIPLE_O2E_RE = re.compile(
+    r'"o2e"\s*:\s*\[\s*([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)\s*,\s*'
+    r'([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)\s*,\s*([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)\s*\]')
+_TRIPLE_O2C_RE = re.compile(
+    r'"o2c"\s*:\s*\[\s*([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)\s*,\s*'
+    r'([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)\s*,\s*([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)\s*\]')
+_BOX_JSON_RE = re.compile(
+    r'"box"\s*:\s*\{\s*"x"\s*:\s*(-?\d+)\s*,\s*"y"\s*:\s*(-?\d+)\s*,\s*'
+    r'"width"\s*:\s*(\d+)\s*,\s*"height"\s*:\s*(\d+)\s*\}')
+_HL_GROUP_RE = re.compile(
+    r'\{\s*"index"\s*:\s*(\d+)\s*,\s*"kind"\s*:\s*"([^"]*)"\s*,\s*'
+    r'"target"\s*:\s*"([^"]*)"\s*,\s*"label"\s*:\s*"([^"]*)"\s*,\s*'
+    r'"closed"\s*:\s*(true|false)(?:\s*,\s*"rgb"\s*:\s*\[([^\]]*)\])?')
+
+
+def _triples(regex: re.Pattern, text: str) -> np.ndarray:
+    """正则抠出的 ``[[x,y,z], ...]`` → ``(N,3) float``（空结果给 ``(0,3)``）。"""
+    rows = regex.findall(text)
+    if not rows:
+        return np.zeros((0, 3), dtype=float)
+    return np.asarray(rows, dtype=float).reshape(-1, 3)
+
+
+def _scan_highlight_groups(text: str) -> list[dict]:
+    """解析 ``highlight_points``（检测边缘线 / 关键点分组）→ 给规划器当"取边种子"。
+
+    每组保留 ``label / kind / target / closed / frame / points(mm)``；
+    颜色、像素半径这些显示用字段不进来（本工程的显示是按深度分色）。
+    """
+    hi = text.find('"highlight_points"')
+    if hi < 0:
+        return []
+    sub = text[hi:]
+    heads = list(_HL_GROUP_RE.finditer(sub))
+    groups: list[dict] = []
+    for k, m in enumerate(heads):
+        seg = sub[m.start(): heads[k + 1].start() if k + 1 < len(heads) else len(sub)]
+        pts = _triples(_TRIPLE_O2E_RE, seg)
+        frame = "end"
+        if pts.shape[0] == 0:
+            pts, frame = _triples(_TRIPLE_O2C_RE, seg), "cam"
+        if pts.shape[0] == 0:
+            continue
+        groups.append(dict(index=int(m.group(1)), kind=m.group(2), target=m.group(3),
+                           label=m.group(4), closed=(m.group(5) == "true"),
+                           rgb=tuple(int(float(v)) for v in m.group(6).split(",")
+                                     if str(v).strip()) if m.group(6) else (),
+                           frame=frame, points=pts))
+    return groups
+
+
+def _checked_xyz(v) -> list[float] | None:
+    """``[x, y, z]``（且都是数字）→ ``[float, float, float]``；否则 ``None``。"""
+    if isinstance(v, (list, tuple)) and len(v) == 3:
+        try:
+            return [float(v[0]), float(v[1]), float(v[2])]
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def _nested_point_groups(obj, *, max_list: int = 20000, max_depth: int = 10) -> list[dict]:
+    """把检测结果里嵌套的 3D 点收成"分组"（给规划器当种子）。
+
+    认两种写法：``{"end": [x,y,z], "cam": [x,y,z]}`` 的点对象，以及它们组成的数组
+    （``contour_points_3d`` / ``inner_points_3d`` / ``outer_hull_3d`` …）。
+    ``end`` 就是 o2e（末端系），``cam`` 是相机光学系；两者都有时优先 ``end``。
+    列表超过 ``max_list`` 项就跳过（防止把大数组再遍历一遍）。
+    """
+    out: list[dict] = []
+
+    def walk(node, name: str, depth: int) -> None:
+        if depth > max_depth:
+            return
+        if isinstance(node, dict):
+            for k, v in node.items():
+                if not isinstance(v, (dict, list)):
+                    continue
+                if isinstance(v, list) and len(v) > max_list:
+                    continue
+                walk(v, str(k), depth + 1)
+        elif isinstance(node, list):
+            ends: list[list[float]] = []
+            cams: list[list[float]] = []
+            for it in node:
+                if not isinstance(it, dict):
+                    continue
+                e = _checked_xyz(it.get("end") if "end" in it else it.get("o2e"))
+                c = _checked_xyz(it.get("cam") if "cam" in it else it.get("o2c"))
+                if e is not None:
+                    ends.append(e)
+                elif c is not None:
+                    cams.append(c)
+            if ends or cams:
+                pts = np.asarray(ends or cams, dtype=float).reshape(-1, 3)
+                low = name.lower()
+                out.append(dict(label=name or "points_3d",
+                                kind="edge" if ends else "points", target="",
+                                closed=any(w in low for w in
+                                           ("contour", "hull", "rim", "edge")),
+                                frame=("end" if ends else "cam"), points=pts))
+                return
+            for it in node:                     # 容器数组（items / boxes …）继续往下找
+                if isinstance(it, (dict, list)):
+                    walk(it, name, depth + 1)
+
+    walk(obj, "", 0)
+    return [g for g in out if g["points"].shape[0] >= 3]
+
+
+def _scan_boxed_cloud(text: str) -> dict | None:
+    """流式解析"多目标框 + 逐点 o2e"的 JSON（如 ``toilet-1.json``）。
+
+    返回 ``dict(points, frame, box, meta)``；不是这种格式返回 ``None``。
+    """
+    bi = text.find('"boxes"')
+    if bi < 0:
+        return None
+    hi = text.find('"highlight_points"')
+    if hi < bi:
+        hi = text.find('"highlight_style"')
+    span = text[bi: hi if hi > bi else len(text)]
+    pts = _triples(_TRIPLE_O2E_RE, span)
+    frame = "end"
+    if pts.shape[0] == 0:
+        pts, frame = _triples(_TRIPLE_O2C_RE, span), "cam"
+    if pts.shape[0] == 0:
+        return None
+
+    bm = _BOX_JSON_RE.search(text)
+    box = None if bm is None else (int(bm.group(1)), int(bm.group(2)),
+                                   int(bm.group(3)), int(bm.group(4)))
+    meta: dict = {"format": "boxes(o2e 逐点)"}
+    tm = re.search(r'"timestamp"\s*:\s*"([^"]*)"', text)
+    if tm:
+        meta["timestamp"] = tm.group(1)
+    cm = re.search(r'"box_count"\s*:\s*(\d+)', text)
+    if cm:
+        meta["box_count"] = int(cm.group(1))
+    ti = text.find('"T_cam_end"')
+    if ti >= 0:
+        nums = [float(v) for v in NUM_RE.findall(text[ti: ti + 4000])][:16]
+        if len(nums) == 16:
+            meta["T_cam_end"] = np.asarray(nums, dtype=float).reshape(4, 4)
+    pm = re.search(r'"pixel_step"\s*:\s*(\d+)', text)
+    if pm:
+        meta["pixel_step"] = int(pm.group(1))
+    seeds = _scan_highlight_groups(text)
+    if seeds:
+        meta["seed_groups"] = seeds
+    return dict(points=pts, frame=frame, box=box, meta=meta)
 
 
 def load_cloud(path, *, intrinsic_path=DEFAULT_INTRINSIC, stride: int = 1,
                depth_min_mm: float = MIN_DEPTH_MM, depth_max_mm=None,
                undistort: bool = True) -> Cloud:
-    """读一帧点云（相机系，mm）。支持 ``*.json``（3D 点 或 16 位深度图）与 ``*.npy``。"""
+    """读一帧点云（末端系 / 相机系，mm）。支持 ``*.json`` 的四种写法和 ``*.npy``。
+
+    * ``depth_o2e`` / ``points`` / ``xyz`` … —— 扁平 3D 点（``frame`` 由文件声明或自动判定）；
+    * ``boxes[].points[]`` 逐像素点对象 —— 只取 ``o2e``（没有就退回 ``o2c``），
+      流式解析，几十 MB 的大文件也不展开成 Python 对象；
+    * ``depth.png_base64`` —— 16 位深度图，用内参反投影（相机光学系）；
+    * 嵌套检测结果里的 ``{cam, end}`` 点（``*_3d``）—— 点云本身用上面的，这些点收进
+      ``cloud.meta["seed_groups"]``，给"点云 → 路径"当取边种子。
+
+    返回的 ``Cloud.frame`` 是点云**自带**的坐标系（``end`` = o2e，已经做过光学→末端）。
+    """
     path = Path(path)
     if not path.is_file():
         raise PointCloudError(f"点云文件不存在：{path}")
@@ -463,10 +654,29 @@ def load_cloud(path, *, intrinsic_path=DEFAULT_INTRINSIC, stride: int = 1,
             pts = pts * 1000.0
         return Cloud(name=path.name, points_mm=pts, source="npy")
     try:
-        obj = json.loads(path.read_text(encoding="utf-8", errors="replace"))
+        text = path.read_text(encoding="utf-8", errors="replace")
+        boxed = _scan_boxed_cloud(text)          # ③ 多目标框 + 逐点 o2e（几十 MB 的大文件）
+        if boxed is not None:
+            pts = np.asarray(boxed["points"], dtype=float).reshape(-1, 3)
+            if pts.shape[0] < 10:
+                raise PointCloudError(f"{path.name} 只有 {pts.shape[0]} 个点，太少")
+            keep = np.isfinite(pts).all(axis=1)
+            if boxed["frame"] != "end":          # 相机系里 z 就是深度；末端系不能这么筛
+                keep &= pts[:, 2] >= float(depth_min_mm)
+                if depth_max_mm is not None:
+                    keep &= pts[:, 2] <= float(depth_max_mm)
+            meta = dict(boxed["meta"])
+            meta["declared_frame"] = boxed["frame"]
+            return Cloud(name=path.name, points_mm=pts[keep],
+                         source="json 目标框 o2e（逐点）", box=boxed["box"],
+                         frame=boxed["frame"], meta=meta)
+        obj = json.loads(text)
+    except PointCloudError:
+        raise
     except ValueError as exc:
         raise PointCloudError(f"{path.name} 不是合法 JSON：{exc}") from exc
 
+    seeds = _nested_point_groups(obj) if isinstance(obj, dict) else []
     pts = _points_from_json(obj)
     if pts is not None:
         if pts.shape[0] < 10:
@@ -479,6 +689,8 @@ def load_cloud(path, *, intrinsic_path=DEFAULT_INTRINSIC, stride: int = 1,
         declared = obj.get("frame") or obj.get("frame_id") if isinstance(obj, dict) else None
         if declared:
             meta["declared_frame"] = declared
+        if seeds:
+            meta["seed_groups"] = seeds
         return Cloud(name=path.name, points_mm=pts[keep], source="json 3D 点",
                      box=_box_tuple(obj.get("box") if isinstance(obj, dict) else None),
                      frame=normalize_frame(declared), meta=meta)
@@ -501,10 +713,12 @@ def load_cloud(path, *, intrinsic_path=DEFAULT_INTRINSIC, stride: int = 1,
     pts = deproject_depth(depth, K, dist, roi=roi, offset_xy=offset, stride=stride,
                           depth_min_mm=depth_min_mm, depth_max_mm=depth_max_mm, scale=scale)
     # 深度图是我们自己按内参反投影出来的 → 一定在**相机光学系**（深度 z 就是相机 z）
+    meta = dict(depth_shape=tuple(int(v) for v in depth.shape), depth_scale=scale,
+                undistort=bool(undistort))
+    if seeds:
+        meta["seed_groups"] = seeds
     return Cloud(name=path.name, points_mm=pts, source="json 深度图 → 反投影",
-                 box=_box_tuple(box_d), frame="cam",
-                 meta=dict(depth_shape=tuple(int(v) for v in depth.shape), depth_scale=scale,
-                           undistort=bool(undistort)))
+                 box=_box_tuple(box_d), frame="cam", meta=meta)
 
 
 def subsample(points, max_points: int = DEFAULT_MAX_POINTS, depth=None):
@@ -854,11 +1068,17 @@ def load_cloud_groups(cfg: dict | None = None) -> list[dict]:
         "point_cloud_groups": [
             {"pose": "110.9 -5.5 396.4 196.6 34.9 111.8",
              "files": ["point_cloud/sink_6_o2e.json", "point_cloud/sink_1_o2e.json"]},
+            {"task": "mirror",                       # ← 用该任务登记的拍摄位姿
+             "files": ["point_cloud/mirror_o2e.json"]},
             {"pose": "...另一组位姿...", "files": ["point_cloud/urinal_o2e_stride5.json"]}
         ]
 
-    返回 ``[{"pose": 6 个数, "files": [路径, ...], "label": 名字}, ...]``；没配就是 ``[]``。
-    位姿不合法 / 文件列表为空的那一组会被**跳过**（不报错，方便边配边试）。
+    ``pose`` 与 ``task`` 二选一（``task`` 优先）：``task`` 取自
+    :data:`revA1_spec.CAPTURE_POSES`（sink / urinal / mirror …），省得两处抄同一组数。
+
+    返回 ``[{"pose": 6 个数, "files": [路径, ...], "label": 名字, "task": 任务名}, ...]``；
+    没配就是 ``[]``。位姿不合法 / 任务名不认识 / 文件列表为空的那一组会被**跳过**
+    （不报错，方便边配边试）。
     """
     raw = (cfg if cfg is not None else _CONFIG).get("point_cloud_groups")
     if not isinstance(raw, list):
@@ -878,12 +1098,15 @@ def load_cloud_groups(cfg: dict | None = None) -> list[dict]:
             paths.append(p if p.is_absolute() else (HERE / p))
         if not paths:
             continue
+        task = str(item.get("task") or "").strip().lower()
         try:
-            pose = parse_pose6(item.get("pose", DEFAULT_POSE))
-        except PointCloudError:
+            pose = (spec.capture_pose(task) if task
+                    else parse_pose6(item.get("pose", DEFAULT_POSE)))
+        except (PointCloudError, KeyError):
             continue
-        out.append(dict(pose=pose, files=paths,
-                        label=str(item.get("label") or f"组{i + 1}")))
+        label = item.get("label") or (spec.CAPTURE_POSES[task]["label"] if task
+                                      else f"组{i + 1}")
+        out.append(dict(pose=pose, files=paths, label=str(label), task=task))
     return out
 
 
@@ -1159,7 +1382,10 @@ def run_selftest(args) -> int:
     # 5) 坐标系判定（o2e = 光学→末端已经做过，不能重复乘手眼）
     probe_o2e = probe_png = None
     try:
-        c_o2e = load_cloud(default_cloud(), stride=2)
+        # ROI 要"紧"才有判别力：sink_* 的 box 是整幅图 (0,0,1440,1080)，
+        # 当成相机系/末端系都落在框里（97% vs 100%），这项检查就没意义了。
+        tight = CLOUD_DIR / "urinal_o2e_stride5.json"
+        c_o2e = load_cloud(tight if tight.is_file() else default_cloud(), stride=2)
         probe_o2e = detect_cloud_frame(c_o2e)
         check("坐标系：o2e 数据判为**末端系**（文件声明 + ROI 反投影一致）",
               probe_o2e["frame"] == "end" and probe_o2e["scores"].get("end", 0.0) > 0.9,

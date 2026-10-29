@@ -106,6 +106,23 @@ def dump_structure(model: mujoco.MjModel) -> None:
         log(f"  camera: {mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_CAMERA, i)}")
 
 
+def pose_deviation(model: mujoco.MjModel, data: mujoco.MjData,
+                   pose) -> tuple[float, float, float]:
+    """当前 ``data`` 的末端位姿 vs ``pose``（mm + 外旋 XYZ 度）。
+
+    返回 ``(工具尖位置差[mm], 工具轴夹角[deg], 完整姿态夹角[deg])``。
+    第三项含绕工具轴的滚转 —— J6 轴写反这种错只有它能看见。
+    """
+    R_ref, p_ref = spec.pose_matrix(pose)
+    tip = ik.site_pos(model, data, "tool_site")
+    R = ik.site_mat(model, data, "ee_site")
+    d_pos = float(np.linalg.norm(tip - p_ref)) * 1000.0
+    d_axis = float(np.degrees(np.arccos(np.clip(np.dot(R_ref[:, 2], R[:, 2]), -1.0, 1.0))))
+    d_full = float(np.degrees(np.arccos(np.clip(
+        (np.trace(R.T @ R_ref) - 1.0) / 2.0, -1.0, 1.0))))
+    return d_pos, d_axis, d_full
+
+
 # ============================================================================ 2
 def check_home(model: mujoco.MjModel, data: mujoco.MjData, floor_z: float) -> None:
     log("\n--- home 姿态（keyframe 'home'）---")
@@ -118,21 +135,18 @@ def check_home(model: mujoco.MjModel, data: mujoco.MjData, floor_z: float) -> No
     log(f"  tool_site = {fmt(ik.site_pos(model, data, 'tool_site'), 4)}  "
         f"离地 {ik.site_pos(model, data, 'tool_site')[2] - floor_z:.3f} m")
     log(f"  工具轴    = {fmt(ik.tool_axis(model, data, 'tool_site'))}")
-    expect_axis = spec.pose_tool_axis(spec.CAPTURE_POSE)
-    got_axis = ik.tool_axis(model, data, "tool_site")
-    dev = float(np.degrees(np.arccos(np.clip(np.dot(expect_axis, got_axis), -1, 1))))
-    log(f"  期望工具轴= {fmt(expect_axis)}（spec.CAPTURE_POSE）偏差 {dev:.3f}°")
     # ⚠️ 只看工具尖 + 工具轴**不够**：它们对 J6 的符号/零位不敏感（工具尖恰在 J6 轴上、
     #    工具轴又是 J6 的旋转轴）。这里把完整 3×3 姿态也对一遍 —— 当年 URDF 把 joint6 的轴
     #    写成 0 0 -1（与真机固件相反）就是这一项抓出来的（差值 158.9°，而前两项全过）。
-    R_home = np.array(data.site_xmat[ik.site_id(model, "ee_site")], dtype=float).reshape(3, 3)
-    R_cap = spec.pose_matrix(spec.CAPTURE_POSE)[0]
-    full = float(np.degrees(np.arccos(np.clip(
-        (np.trace(R_home.T @ R_cap) - 1.0) / 2.0, -1.0, 1.0))))
-    log(f"  完整姿态偏差= {full:.4f}°（含绕工具轴滚转；与 spec.CAPTURE_POSE 的 3×3 比）")
+    expect_axis = spec.pose_tool_axis(spec.HOME_POSE)
+    d_pos, d_axis, full = pose_deviation(model, data, spec.HOME_POSE)
+    log(f"  期望工具轴= {fmt(expect_axis)}（spec.HOME_POSE）偏差 {d_axis:.3f}°")
+    log(f"  工具尖差  = {d_pos:.3f} mm（spec.HOME_POSE 与 spec.TARGET_POSE 是同一组数）")
+    log(f"  完整姿态偏差= {full:.4f}°（含绕工具轴滚转；与 spec.HOME_POSE 的 3×3 比）")
     if full > 1.0:
-        warn(f"home 与 CAPTURE_POSE 的完整姿态差 {full:.2f}°：多半有某个关节的轴/零位写反了"
-             "（J6 这类错在工具尖/工具轴上都看不出来）→ 看 revA1_spec.JOINT_AXIS_FIX")
+        warn(f"home 与 HOME_POSE 的完整姿态差 {full:.2f}°：多半是场景 XML 没按新 home 重生成，"
+             "或某个关节的轴/零位写反了（J6 这类错在工具尖/工具轴上都看不出来）"
+             "→ 先 python convert_urdf_to_mjcf.py，再查 revA1_spec.JOINT_AXIS_FIX")
     log(f"  重力力矩  = {fmt(data.qfrc_bias[:6], 1)} Nm")
     log(f"  自碰撞对数= {data.ncon}")
 
@@ -182,12 +196,48 @@ def check_home(model: mujoco.MjModel, data: mujoco.MjData, floor_z: float) -> No
             warn(f"{j} 的 forcerange 小于最坏重力力矩，满伸姿态会塌")
 
 
+# ============================================================================ 2b
+def check_capture_poses(model: mujoco.MjModel, data: mujoco.MjData, floor_z: float) -> None:
+    """**拍摄位姿**（按任务，见 ``spec.CAPTURE_POSES``）：关节角 ↔ 真机 pose 对一遍。
+
+    为什么值得单独查：点云是 o2e（末端系），搬回基座系全靠这一组位姿；pose 里只要有一个数
+    写错（或者模型与真机的关节零位/轴对不上），点云就会整片歪掉，而画面里看不出来。
+    """
+    log("\n--- 拍摄位姿（按任务：关节角 ↔ 真机 pose）---")
+    for name in spec.capture_names():
+        item = spec.CAPTURE_POSES[name]
+        ik.set_arm_qpos(model, data, np.radians(item["qpos_deg"]))
+        mujoco.mj_forward(model, data)
+        tip = ik.site_pos(model, data, "tool_site")
+        d_pos, d_axis, d_full = pose_deviation(model, data, item["pose"])
+        log(f"  [{name}] {item['label']}")
+        log(f"    qpos(度)  = {fmt(item['qpos_deg'], 2)}")
+        log(f"    pose      = {fmt(item['pose'], 3)}  mm / deg")
+        log(f"    FK 工具尖 = {fmt(tip * 1000.0, 1)} mm  离地 {tip[2] - floor_z:.3f} m"
+            f"  自碰撞 {data.ncon} 对")
+        log(f"    与 pose 差= 位置 {d_pos:.2f} mm / 工具轴 {d_axis:.3f}° / 完整姿态 {d_full:.3f}°")
+        if d_pos > 2.0 or d_full > 1.0:
+            warn(f"{name} 的拍摄位姿与 pose 对不上（位置 {d_pos:.2f} mm / 完整姿态 "
+                 f"{d_full:.2f}°）：pose 或 qpos_deg 写错了，或者模型与真机的关节零位/轴不一致")
+        if data.ncon:
+            warn(f"{name} 拍摄位姿有 {data.ncon} 对自碰撞接触（拍点云时不该贴到自己）")
+    # 收尾：恢复 home（后面的检查都假定从 home 出发）
+    if not ik.reset_home(model, data):
+        mujoco.mj_forward(model, data)
+
+
 # ============================================================================ 3
 def check_stability(model: mujoco.MjModel, data: mujoco.MjData) -> None:
     log("\n--- 稳定性：home 姿态静置 3 s（看漂移/振动）---")
     if not ik.reset_home(model, data):
         mujoco.mj_forward(model, data)
     q0 = ik.arm_qpos(model, data)
+    # 位置伺服没有积分项 → 静置时**本来就会**下垂「重力力矩 / kp」（真机也一样，不是缺陷；
+    # 老 home 姿态轻，下垂 0.27°，新 home 是近水平姿态、J2 撑 177.8 Nm，下垂 0.51°）。
+    # 所以先把这个预期量算出来当基准：**超过预期 + 0.2°** 才算异常（振动 / 撑不住 / 限位没夹住）。
+    kp = np.array([model.actuator_gainprm[mujoco.mj_name2id(
+        model, mujoco.mjtObj.mjOBJ_ACTUATOR, f"act_{j}")][0] for j in spec.JOINTS])
+    droop = np.degrees(np.abs(data.qfrc_bias[:6]) / np.maximum(kp, 1e-9))
     n = int(3.0 / model.opt.timestep)
     hist = np.zeros((n, 6))
     for k in range(n):
@@ -195,21 +245,23 @@ def check_stability(model: mujoco.MjModel, data: mujoco.MjData) -> None:
         hist[k] = ik.arm_qpos(model, data)
     drift = np.degrees(np.abs(hist[-1] - q0))
     peak = np.degrees(np.abs(hist - q0).max(axis=0))
+    log(f"  预期下垂(度) = {fmt(droop, 3)}  （重力力矩/kp，位置伺服无积分项 → 正常）")
     log(f"  末态偏差(度) = {fmt(drift, 3)}")
     log(f"  过程峰值(度) = {fmt(peak, 3)}   自碰撞对数 = {data.ncon}")
-    if drift.max() > 0.5:
-        warn(f"静置漂移 {drift.max():.2f}° > 0.5°，建议加大 kp 或减小负载")
+    extra = drift - droop
+    if extra.max() > 0.2:
+        warn(f"静置漂移比预期下垂还多 {extra.max():.2f}°（> 0.2°），建议加大 kp 或减小负载")
     if peak.max() > 2.0:
         warn(f"过程中抖了 {peak.max():.2f}°，检查 kv/armature/damping")
 
 
 # ============================================================================ 3b
 def check_tools(model: mujoco.MjModel, data: mujoco.MjData, floor_z: float) -> None:
-    """三个工具（夹爪 / 喷嘴1 / 喷嘴2）的 TCP 向量：在 home 姿态下算一遍世界坐标。
+    """各工具的 TCP 向量：在 home 姿态下算一遍世界坐标。
 
     TCP 向量定义在 ``revA1_spec.TOOLS``（末端法兰系，m），画面上的箭头 = 法兰原点 + R·v。
     """
-    log("\n--- 三个工具的 TCP（home 姿态，末端法兰系向量 → 世界坐标）---")
+    log("\n--- 各工具的 TCP（home 姿态，末端法兰系向量 → 世界坐标）---")
     if not ik.reset_home(model, data):
         mujoco.mj_forward(model, data)
     sid = ik.site_id(model, "ee_site")
@@ -383,6 +435,7 @@ def main(argv: list[str] | None = None) -> int:
 
     dump_structure(model)
     check_home(model, data, floor_z)
+    check_capture_poses(model, data, floor_z)
     check_tools(model, data, floor_z)
     check_stability(model, data)
     check_workspace(model, data, floor_z, args.samples)

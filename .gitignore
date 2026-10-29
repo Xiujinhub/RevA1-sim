@@ -5,3 +5,8 @@ runs/
 # 点云场景的生成物（point_cloud.py / 界面「加载点云」产出，几十 MB，不进库）
 assets/revA1_pc_scene*.xml
 assets/meshes/pc_cloud_*.obj
+# 路径仿真场景的生成物（arm_path.py --render / --sim）
+assets/revA1_plan_scene.xml
+assets/meshes/pc_plan_*.obj
+# 点云原始数据（从数据库导出的 json，单个几十 MB，不进库）
+point_cloud/
